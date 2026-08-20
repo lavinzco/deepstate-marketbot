@@ -294,13 +294,15 @@ async fn cancel_order<P: Provider + Clone + Send + Sync + 'static>(
 }
 
 async fn fetch_top_of_book<P: Provider + Clone + Send + Sync + 'static>(
-    v1: &DeepstateV1<P>,
+    v1: &DeepstateV1::DeepstateV1Instance<P>,
     token0: Address,
     token1: Address,
     epoch: u64,
     book_id: B256,
 ) -> Result<(Option<Order>, Option<Order>)> {
-    let (ask_root, bid_root) = v1.roots(token0, token1, U256::from(epoch)).call().await?;
+    let roots = v1.roots(token0, token1, U256::from(epoch)).call().await?;
+    let ask_root = roots.askRoot;
+    let bid_root = roots.bidRoot;
     let (bid, bid_nonce) = walk_top(v1, book_id, bid_root).await?;
     let (ask, ask_nonce) = walk_top(v1, book_id, ask_root).await?;
     let bid_meta = v1.topOrder(book_id, true).call().await?;
@@ -317,7 +319,7 @@ async fn fetch_top_of_book<P: Provider + Clone + Send + Sync + 'static>(
 }
 
 async fn walk_top<P: Provider + Clone + Send + Sync + 'static>(
-    v1: &DeepstateV1<P>,
+    v1: &DeepstateV1::DeepstateV1Instance<P>,
     book_id: B256,
     mut node: B256,
 ) -> Result<(Option<Order>, u32)> {
@@ -325,7 +327,9 @@ async fn walk_top<P: Provider + Clone + Send + Sync + 'static>(
         if node == B256::ZERO {
             return Ok((None, 0));
         }
-        let (left, right) = v1.tree(book_id, node).call().await?;
+        let children = v1.tree(book_id, node).call().await?;
+        let left = children.leftNode;
+        let right = children.rightNode;
         if left == B256::ZERO {
             let order = unpack(&node);
             return Ok((Some(order), order.nonce));

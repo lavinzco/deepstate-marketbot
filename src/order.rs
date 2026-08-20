@@ -7,7 +7,7 @@
 //! - bits 0-31:    32-bit nonce (0 for fill, engine-assigned when resting)
 
 use alloy::primitives::{B256, U256};
-use anyhow::{ensure, Result};
+use anyhow::Result;
 
 pub const TICK_OFFSET: usize = 224;
 pub const QUANTITY_OFFSET: usize = 64;
@@ -22,9 +22,6 @@ pub struct Order {
 
 /// Pack an order into the contract's bytes32 representation.
 pub fn pack(tick: i32, quantity: u128, nonce: u32) -> Result<B256> {
-    ensure!(quantity <= u128::MAX, "quantity out of range");
-    ensure!(tick >= i32::MIN && tick <= i32::MAX, "tick must be int32");
-
     // tick as two's-complement uint32
     let tick_u32 = tick as u32;
     let tick_bits = U256::from(tick_u32);

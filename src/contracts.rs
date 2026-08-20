@@ -1,9 +1,7 @@
 //! Deepstate contract interfaces and interaction helpers.
 
-use alloy::primitives::{Address, B256, U256};
-use alloy::providers::Provider;
+use alloy::primitives::{Address, B256};
 use alloy::sol;
-use anyhow::Result;
 
 sol! {
     #[sol(rpc)]

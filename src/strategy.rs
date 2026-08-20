@@ -4,7 +4,7 @@
 //! Strategy: keep a bid 1 tick below the current best bid (or at target) and
 //! an ask 1 tick above the current best ask, sized to the full-reward target.
 
-use crate::order::{self, Order};
+use crate::order::Order;
 use crate::tick;
 use anyhow::Result;
 
