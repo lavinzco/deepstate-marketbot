@@ -2,8 +2,7 @@
 //!
 //! Usage: DEEPSTATE_RPC_URL=<rpc> cargo run --bin probe
 
-use alloy::primitives::{Address, U256};
-use alloy::providers::{Provider, ProviderBuilder};
+use alloy::providers::ProviderBuilder;
 use anyhow::Result;
 use deepstate_mm::contracts::{compute_pool_id, sorted_pair, DeepstateV1, ROUTER};
 
@@ -25,8 +24,14 @@ async fn main() -> Result<()> {
             println!("activeBook:  {book:#x}");
             let top_bid = v1.topOrder(book, true).call().await?;
             let top_ask = v1.topOrder(book, false).call().await?;
-            println!("topBid:      nonce={} sold={}", top_bid.nonce, top_bid.soldAmount);
-            println!("topAsk:      nonce={} sold={}", top_ask.nonce, top_ask.soldAmount);
+            println!(
+                "topBid:      nonce={} sold={}",
+                top_bid.nonce, top_bid.soldAmount
+            );
+            println!(
+                "topAsk:      nonce={} sold={}",
+                top_ask.nonce, top_ask.soldAmount
+            );
         }
         Err(e) => println!("poolEpoch failed: {e:#} (pool may not be initialized)"),
     }

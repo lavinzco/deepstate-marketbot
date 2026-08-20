@@ -30,7 +30,7 @@ export DEEPSTATE_PRIVATE_KEY=0x你的私钥
 export DEEPSTATE_MID_PRICE=125.0        # NVDA 参考价 (USDG per NVDA)
 export DEEPSTATE_SPREAD=0.005           # 半价差 0.5%
 export DEEPSTATE_INTERVAL=30            # 报价刷新间隔（秒）
-export DEEPSTATE_BID_QTY=1000000        # bid 数量 (1 USDG, 6 decimals)
+export DEEPSTATE_BID_QTY=1000000000000000  # bid 数量 (0.001 NVDA, base units)
 export DEEPSTATE_ASK_QTY=1000000000000000000  # ask 数量 (1 NVDA, 18 decimals)
 
 # 2. 构建 + 测试
@@ -82,4 +82,5 @@ rewarder.distributeRewards(bookId, order, soldToken)
 - **存货风险**：NVDA 价格波动可能导致 bid 被吃后持有亏损仓位
 - **价格竞争**：只有最优价赚奖励，需要持续盯盘调价
 - **实验协议**：Deepstate 官方声明可能失败，仅用少量资金
-- 生产环境建议接入真实美股价格源（当前用静态参考价）
+- 主循环每轮通过 `roots` + `tree` 读取链上完整 top leaf（不会把 `topOrder.soldAmount` 猜成 tick）；`topOrder` 只用于 nonce 一致性校验。
+- `DEEPSTATE_MID_PRICE` 仍是外部参考价，必须由部署者提供可验证行情源；没有链上 top leaf 时策略回退到参考价目标。

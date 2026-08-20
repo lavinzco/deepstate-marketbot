@@ -8,15 +8,17 @@
 //!   DEEPSTATE_MID_PRICE    reference mid price in USDG per NVDA
 //!   DEEPSTATE_SPREAD       half-spread fraction (default 0.005)
 //!   DEEPSTATE_INTERVAL     quote refresh interval seconds (default 30)
-//!   DEEPSTATE_BID_QTY      bid size in USDG raw units (default 1e6 = 1 USDG)
-//!   DEEPSTATE_ASK_QTY      ask size in NVDA raw units (default 1e18 = 1 NVDA)
+//!   DEEPSTATE_BID_QTY      bid size in NVDA base units, 18 decimals (default 1e15 = 0.001 NVDA)
+//!   DEEPSTATE_ASK_QTY      ask size in NVDA base units, 18 decimals (default 1e18 = 1 NVDA)
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use anyhow::{ensure, Result};
-use deepstate_mm::contracts::{compute_pool_id, sorted_pair, DeepstateRewarder, DeepstateV1, ERC20, REWARDER, ROUTER};
-use deepstate_mm::order::pack;
+use deepstate_mm::contracts::{
+    compute_pool_id, sorted_pair, DeepstateRewarder, DeepstateV1, ERC20, REWARDER, ROUTER,
+};
+use deepstate_mm::order::{pack, unpack, Order};
 use deepstate_mm::strategy::{compute_quotes, describe_order, MmConfig};
 use std::env;
 use std::time::Duration;
@@ -24,17 +26,33 @@ use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 const DEFAULT_RPC: &str = "https://rpc.mainnet.chain.robinhood.com";
+const EXPECTED_CHAIN_ID: u64 = 4663;
+
+/// A resting order we have live on the book.
+#[derive(Debug, Clone)]
+struct ActiveOrder {
+    /// Packed resting order returned by the engine (contains the assigned nonce).
+    packed: B256,
+    /// Epoch the order was placed in (needed for bookId + cancel).
+    epoch: u64,
+    /// Token sold when this order fills (USDG for bid, NVDA for ask) — used for reward claims.
+    sold_token: Address,
+    claimant_registered: bool,
+    cancelled: bool,
+}
 
 #[derive(Debug, Default)]
 struct ActiveOrders {
-    bid: Option<(B256, u64)>, // (packed resting order, epoch)
-    ask: Option<(B256, u64)>,
+    bid: Option<ActiveOrder>,
+    ask: Option<ActiveOrder>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     let key = env::var("DEEPSTATE_PRIVATE_KEY").expect("DEEPSTATE_PRIVATE_KEY not set");
@@ -47,13 +65,34 @@ async fn main() -> Result<()> {
         .wallet(signer.clone())
         .connect_http(rpc.parse()?);
 
-    let cfg = load_config();
+    // A1: verify we are talking to Robinhood Chain before touching any funds.
+    let chain_id = provider.get_chain_id().await?;
+    ensure!(
+        chain_id == EXPECTED_CHAIN_ID,
+        "unexpected chain id {chain_id}, expected {EXPECTED_CHAIN_ID} (Robinhood Chain)"
+    );
+    info!(chain_id, "chain id verified");
+
+    let cfg = load_config()?;
     let (token0, token1) = sorted_pair();
     info!(?token0, ?token1, mid = cfg.mid_price, "pair");
 
     // Approve USDG + NVDA for the router.
-    ensure_allowance(&provider, token0, U256::from(cfg.bid_quantity)).await?;
-    ensure_allowance(&provider, token1, U256::from(cfg.ask_quantity)).await?;
+    // S3: public RPCs return an empty account list, so use the signer address directly.
+    ensure_allowance(
+        &provider,
+        signer.address(),
+        token0,
+        U256::from(cfg.bid_quantity),
+    )
+    .await?;
+    ensure_allowance(
+        &provider,
+        signer.address(),
+        token1,
+        U256::from(cfg.ask_quantity),
+    )
+    .await?;
     info!("allowances ready");
 
     let mut active = ActiveOrders::default();
@@ -67,7 +106,7 @@ async fn main() -> Result<()> {
     }
 }
 
-fn load_config() -> MmConfig {
+fn load_config() -> Result<MmConfig> {
     let mut cfg = MmConfig::default();
     if let Ok(v) = env::var("DEEPSTATE_MID_PRICE") {
         cfg.mid_price = v.parse().expect("DEEPSTATE_MID_PRICE must be float");
@@ -84,17 +123,37 @@ fn load_config() -> MmConfig {
     if let Ok(v) = env::var("DEEPSTATE_ASK_QTY") {
         cfg.ask_quantity = v.parse().expect("DEEPSTATE_ASK_QTY must be u128");
     }
-    cfg
+
+    // A5: validate configuration before the bot starts quoting.
+    ensure!(
+        cfg.mid_price.is_finite() && cfg.mid_price > 0.0,
+        "DEEPSTATE_MID_PRICE must be finite and > 0, got {}",
+        cfg.mid_price
+    );
+    ensure!(
+        cfg.half_spread_pct > 0.0 && cfg.half_spread_pct < 1.0,
+        "DEEPSTATE_SPREAD must be in (0, 1), got {}",
+        cfg.half_spread_pct
+    );
+    ensure!(
+        cfg.interval_secs >= 5,
+        "DEEPSTATE_INTERVAL must be >= 5 seconds, got {}",
+        cfg.interval_secs
+    );
+    ensure!(
+        cfg.bid_quantity > 0 && cfg.ask_quantity > 0,
+        "DEEPSTATE_BID_QTY and DEEPSTATE_ASK_QTY must be > 0"
+    );
+    Ok(cfg)
 }
 
 async fn ensure_allowance<P: Provider + Clone + Send + Sync + 'static>(
     provider: &P,
+    owner: Address,
     token: Address,
     amount: U256,
 ) -> Result<()> {
     let erc20 = ERC20::new(token, provider.clone());
-    let accounts = provider.get_accounts().await?;
-    let owner = accounts.first().copied().ok_or_else(|| anyhow::anyhow!("no accounts"))?;
     let current = erc20.allowance(owner, ROUTER).call().await?;
     if current >= amount {
         return Ok(());
@@ -116,23 +175,29 @@ async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
     let v1 = DeepstateV1::new(ROUTER, provider.clone());
 
     let epoch = v1.poolEpoch(pid).call().await?.to::<u64>();
-    let book_id = v1.activeBookId(token0, token1).call().await?;
+    // bookId(token0, token1, epoch) is pure; use it for reward claims + cancels.
+    let book_id = v1.bookId(token0, token1, U256::from(epoch)).call().await?;
     info!(epoch, ?book_id, "cycle start");
 
-    // Desired quotes (based on external reference price).
-    let quotes = compute_quotes(cfg, None, None)?;
+    let (top_bid, top_ask) = fetch_top_of_book(&v1, token0, token1, epoch, book_id).await?;
+    let quotes = compute_quotes(cfg, top_bid.as_ref(), top_ask.as_ref())?;
     info!(
         bid = describe_order(&quotes.bid, cfg.decimals0, cfg.decimals1),
         ask = describe_order(&quotes.ask, cfg.decimals0, cfg.decimals1),
         "computed quotes"
     );
 
-    // Cancel stale orders.
-    if let Some((packed, old_epoch)) = active.bid.take() {
-        cancel_order(provider, token0, token1, old_epoch, packed).await?;
+    // Close stale orders and claim rewards.
+    // S4: registerClaimant MUST run BEFORE cancel (otherwise rewards are lost forever),
+    // and distributeRewards runs AFTER cancel. S6: only drop the active state once the
+    // order has been closed successfully — a failed cancel keeps the order for retry.
+    if let Some(order) = active.bid.as_mut() {
+        close_active_order(provider, token0, token1, order).await?;
+        active.bid.take();
     }
-    if let Some((packed, old_epoch)) = active.ask.take() {
-        cancel_order(provider, token0, token1, old_epoch, packed).await?;
+    if let Some(order) = active.ask.as_mut() {
+        close_active_order(provider, token0, token1, order).await?;
+        active.ask.take();
     }
 
     // Place fresh bid + ask.
@@ -140,10 +205,26 @@ async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
     let ask_packed = pack(quotes.ask.tick, quotes.ask.quantity, 0)?;
 
     let bid_resting = place_order(provider, token0, token1, epoch, bid_packed, true).await?;
-    active.bid = Some((bid_resting, epoch));
+    if bid_resting != B256::ZERO {
+        active.bid = Some(ActiveOrder {
+            packed: bid_resting,
+            epoch,
+            sold_token: token0,
+            claimant_registered: false,
+            cancelled: false,
+        }); // bid sells USDG
+    }
 
     let ask_resting = place_order(provider, token0, token1, epoch, ask_packed, false).await?;
-    active.ask = Some((ask_resting, epoch));
+    if ask_resting != B256::ZERO {
+        active.ask = Some(ActiveOrder {
+            packed: ask_resting,
+            epoch,
+            sold_token: token1,
+            claimant_registered: false,
+            cancelled: false,
+        }); // ask sells NVDA
+    }
 
     info!("cycle complete");
     Ok(())
@@ -167,12 +248,31 @@ async fn place_order<P: Provider + Clone + Send + Sync + 'static>(
         noRest: false,
         fillOrKill: false,
     };
+    // S2: simulate first to get the resting order (engine assigns the nonce at fill time).
+    // The returned bytes32 is the order we must store as active and cancel later.
+    let resting = v1.fill(params.clone()).call().await?;
     let pending = v1.fill(params).send().await?;
     let receipt = pending.get_receipt().await?;
     ensure!(receipt.status(), "fill tx failed");
     let side = if is_bid { "bid" } else { "ask" };
-    info!(%side, %order, tx=%receipt.transaction_hash, "order placed");
-    Ok(order)
+    info!(%side, %resting, tx=%receipt.transaction_hash, "order placed");
+    if resting == B256::ZERO {
+        info!(%side, tx=%receipt.transaction_hash, "fill completed without resting order");
+        return Ok(resting);
+    }
+    let key = v1
+        .orderId(
+            v1.bookId(token0, token1, U256::from(epoch)).call().await?,
+            resting,
+        )
+        .call()
+        .await?;
+    let owner = v1.ownerOfOrder(key).call().await?;
+    ensure!(
+        owner != Address::ZERO,
+        "returned resting order has no on-chain owner"
+    );
+    Ok(resting)
 }
 
 async fn cancel_order<P: Provider + Clone + Send + Sync + 'static>(
@@ -183,27 +283,102 @@ async fn cancel_order<P: Provider + Clone + Send + Sync + 'static>(
     order: B256,
 ) -> Result<()> {
     let v1 = DeepstateV1::new(ROUTER, provider.clone());
-    let pending = v1.cancel(token0, token1, U256::from(epoch), order).send().await?;
+    let pending = v1
+        .cancel(token0, token1, U256::from(epoch), order)
+        .send()
+        .await?;
     let receipt = pending.get_receipt().await?;
     ensure!(receipt.status(), "cancel tx failed");
     info!(%order, tx=%receipt.transaction_hash, "order cancelled");
     Ok(())
 }
 
-/// Claim DEEP rewards for a closed order.
-/// Sequence: registerClaimant -> (order already cancelled) -> distributeRewards.
-pub async fn claim_rewards<P: Provider + Clone + Send + Sync + 'static>(
-    provider: &P,
+async fn fetch_top_of_book<P: Provider + Clone + Send + Sync + 'static>(
+    v1: &DeepstateV1<P>,
+    token0: Address,
+    token1: Address,
+    epoch: u64,
     book_id: B256,
-    order: B256,
-    sold_token: Address,
+) -> Result<(Option<Order>, Option<Order>)> {
+    let (ask_root, bid_root) = v1.roots(token0, token1, U256::from(epoch)).call().await?;
+    let (bid, bid_nonce) = walk_top(v1, book_id, bid_root).await?;
+    let (ask, ask_nonce) = walk_top(v1, book_id, ask_root).await?;
+    let bid_meta = v1.topOrder(book_id, true).call().await?;
+    let ask_meta = v1.topOrder(book_id, false).call().await?;
+    ensure!(
+        bid.map_or(bid_nonce == 0, |o| o.nonce == bid_meta.nonce),
+        "bid top nonce mismatch"
+    );
+    ensure!(
+        ask.map_or(ask_nonce == 0, |o| o.nonce == ask_meta.nonce),
+        "ask top nonce mismatch"
+    );
+    Ok((bid, ask))
+}
+
+async fn walk_top<P: Provider + Clone + Send + Sync + 'static>(
+    v1: &DeepstateV1<P>,
+    book_id: B256,
+    mut node: B256,
+) -> Result<(Option<Order>, u32)> {
+    for _ in 0..256 {
+        if node == B256::ZERO {
+            return Ok((None, 0));
+        }
+        let (left, right) = v1.tree(book_id, node).call().await?;
+        if left == B256::ZERO {
+            let order = unpack(&node);
+            return Ok((Some(order), order.nonce));
+        }
+        node = if right != B256::ZERO { right } else { left };
+    }
+    Err(anyhow::anyhow!("book tree exceeded 256 levels"))
+}
+
+/// Close a resting order and claim its rewards.
+///
+/// Order matters (S4): registerClaimant MUST happen while the order is still resting
+/// (BEFORE cancel), and distributeRewards AFTER the cancel. Reversing register/cancel
+/// loses the rewards permanently.
+async fn close_active_order<P: Provider + Clone + Send + Sync + 'static>(
+    provider: &P,
+    token0: Address,
+    token1: Address,
+    order: &mut ActiveOrder,
 ) -> Result<()> {
     let rewarder = DeepstateRewarder::new(REWARDER, provider.clone());
-    let pending = rewarder.registerClaimant(book_id, order).send().await?;
-    pending.get_receipt().await?;
-    let pending = rewarder.distributeRewards(book_id, order, sold_token).send().await?;
+    let engine = DeepstateV1::new(ROUTER, provider.clone());
+    let book_id = engine
+        .bookId(token0, token1, U256::from(order.epoch))
+        .call()
+        .await?;
+
+    // 1. Register claimant while the order is still on the book.
+    if !order.claimant_registered {
+        let pending = rewarder
+            .registerClaimant(book_id, order.packed)
+            .send()
+            .await?;
+        let receipt = pending.get_receipt().await?;
+        ensure!(receipt.status(), "registerClaimant tx failed");
+        order.claimant_registered = true;
+        info!(order=%order.packed, tx=%receipt.transaction_hash, "claimant registered");
+    }
+
+    // 2. Cancel the order (releases collateral + any fills).
+    if !order.cancelled {
+        cancel_order(provider, token0, token1, order.epoch, order.packed).await?;
+        order.cancelled = true;
+    }
+
+    // 3. Distribute rewards after the order is closed. A failure keeps the active state
+    // so the next cycle retries this step without repeating register/cancel.
+    let pending = rewarder
+        .distributeRewards(book_id, order.packed, order.sold_token)
+        .send()
+        .await?;
     let receipt = pending.get_receipt().await?;
-    ensure!(receipt.status(), "distribute tx failed");
-    info!(%order, tx=%receipt.transaction_hash, "rewards distributed");
+    ensure!(receipt.status(), "distributeRewards tx failed");
+    info!(order=%order.packed, tx=%receipt.transaction_hash, "rewards distributed");
     Ok(())
 }

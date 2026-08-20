@@ -2,8 +2,8 @@
 //!
 //! Layout (MSB -> LSB):
 //! - bits 224-255: signed 32-bit tick (two's complement)
-//! - bits 64-223:  160-bit quantity
-//! - bits 32-63:   reserved
+//! - bits 64-223:  160-bit quantity (base token units)
+//! - bits 32-63:   correction code (engine-set on resting orders)
 //! - bits 0-31:    32-bit nonce (0 for fill, engine-assigned when resting)
 
 use alloy::primitives::{B256, U256};
@@ -11,7 +11,6 @@ use anyhow::{ensure, Result};
 
 pub const TICK_OFFSET: usize = 224;
 pub const QUANTITY_OFFSET: usize = 64;
-pub const MASK_32: U256 = U256::from_limbs([u64::MAX, 0, 0, 0]); // low 64 bits covers 32
 pub const MASK_160: U256 = U256::from_limbs([u64::MAX, u64::MAX, 0, 0]);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,7 +52,11 @@ pub fn unpack(packed: &B256) -> Order {
         tick_raw as i32
     };
 
-    Order { tick, quantity, nonce }
+    Order {
+        tick,
+        quantity,
+        nonce,
+    }
 }
 
 #[cfg(test)]
@@ -62,7 +65,11 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_roundtrip() {
-        let o = Order { tick: 12345, quantity: 1_000_000, nonce: 7 };
+        let o = Order {
+            tick: 12345,
+            quantity: 1_000_000,
+            nonce: 7,
+        };
         let packed = pack(o.tick, o.quantity, o.nonce).unwrap();
         let back = unpack(&packed);
         assert_eq!(o, back);
@@ -70,7 +77,11 @@ mod tests {
 
     #[test]
     fn test_negative_tick() {
-        let o = Order { tick: -54321, quantity: 500, nonce: 0 };
+        let o = Order {
+            tick: -54321,
+            quantity: 500,
+            nonce: 0,
+        };
         let packed = pack(o.tick, o.quantity, o.nonce).unwrap();
         let back = unpack(&packed);
         assert_eq!(o, back);
