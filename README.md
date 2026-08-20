@@ -19,6 +19,7 @@ src/
 ├── order.rs        # 订单打包 (tick<<224 | qty<<64 | nonce)
 ├── strategy.rs     # 报价策略（bid/ask 计算）
 ├── main.rs         # 主循环（撤单+下单）
+├── bin/deepstate_gui.rs # Windows/Linux egui GUI MVP（默认只读预览）
 └── bin/probe.rs    # 只读探针（查链上状态）
 ```
 
@@ -40,9 +41,24 @@ cargo test
 # 3. 只读探针（先看链上状态，不下单）
 cargo run --bin probe
 
-# 4. 运行机器人
+# 4. 启动 GUI（Windows PowerShell 也可使用同一命令）
+cargo run --bin deepstate_gui
+
+# 5. 运行机器人
 cargo run
 ```
+
+### Windows 构建
+
+安装 Rust stable 与 Visual Studio Build Tools（Desktop development with C++），然后在 PowerShell 中运行：
+
+```powershell
+cargo fmt --check
+cargo build --release --bin deepstate_gui
+cargo run --release --bin deepstate_gui
+```
+
+GUI 默认是 **Live trading disabled**，Start 只计算本地报价并执行只读 RPC chain-id 检查，不发送交易。私钥输入框是密码框且不会被日志记录；不要把私钥提交到仓库。即使勾选 Live trading，MVP 仍明确拒绝提交链上交易，且必须输入 `I UNDERSTAND` 才能启动，直到执行引擎经过独立审计并接入明确的交易确认流程。
 
 ## 链上参数（Robinhood Chain, Chain ID 4663）
 
