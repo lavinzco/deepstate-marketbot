@@ -1,12 +1,13 @@
 //! Tick <-> price conversion (Deepstate TickMath32)
 //!
-//! price = 2^(96 * tick / 2^31)
-//! tick  = log2(price) * 2^31 / 96
+//! protocol price = 2^(96 * tick / 2^31), expressed as token1/token0
+//! in raw units. Human quote/base price is its reciprocal after decimal
+//! normalization.
 
 const TWO_POW_31: f64 = 2_147_483_648.0;
 const LOG_BASE: f64 = 96.0 / TWO_POW_31;
 
-/// Protocol tick -> raw contract price (quote/base in raw units, i.e. token0 per token1).
+/// Protocol tick -> raw token1/token0 contract price.
 pub fn tick_to_price(tick: i32) -> f64 {
     2f64.powf(LOG_BASE * tick as f64)
 }
@@ -19,13 +20,13 @@ pub fn price_to_tick(price: f64) -> f64 {
     price.log2() * TWO_POW_31 / 96.0
 }
 
-/// Human-readable price (quote/base, i.e. token0 per token1) -> raw contract price.
+/// Human-readable quote/base price -> raw token1/token0 contract price.
 ///
-/// The tick represents a quote/base price: `raw = human * 10^(dec0 - dec1)`.
-/// e.g. NVDA/USDG: dec0 = 6 (USDG), dec1 = 18 (NVDA) -> raw = human * 1e-12.
+/// e.g. NVDA/USDG: dec0 = 6 (USDG), dec1 = 18 (NVDA) -> raw =
+/// `1 / (human * 10^(dec0 - dec1))`.
 pub fn human_to_contract_price(human_price: f64, decimals0: u8, decimals1: u8) -> f64 {
     let scale = 10f64.powi(decimals0 as i32 - decimals1 as i32);
-    human_price * scale
+    1.0 / (human_price * scale)
 }
 
 /// Human-readable price -> tick, floored (maker bid side).
@@ -40,11 +41,11 @@ pub fn price_to_tick_ceil(human_price: f64, decimals0: u8, decimals1: u8) -> i32
     price_to_tick(contract_price).ceil() as i32
 }
 
-/// Protocol tick -> human-readable price (quote/base, i.e. token0 per token1).
+/// Protocol tick -> human-readable quote/base price.
 pub fn tick_to_human_price(tick: i32, decimals0: u8, decimals1: u8) -> f64 {
     let contract_price = tick_to_price(tick);
     let scale = 10f64.powi(decimals0 as i32 - decimals1 as i32);
-    contract_price / scale
+    1.0 / (contract_price * scale)
 }
 
 #[cfg(test)]
@@ -62,19 +63,19 @@ mod tests {
 
     #[test]
     fn test_absolute_tick_magnitude() {
-        // $125 USDG per NVDA -> raw price 1.25e-10 -> tick ≈ -735.9M (negative, ~7.36e8).
-        // Guards against the 10^(dec1-dec0) sign inversion (which would give +735.9M).
+        // $125 USDG per NVDA -> inverse raw price 8e9 -> tick ≈ +735.9M.
+        // Guards against the token-decimal and protocol price-direction inversion.
         let tick = price_to_tick_floor(125.0, 6, 18);
-        assert!(tick < 0, "tick must be negative, got {tick}");
+        assert!(tick > 0, "tick must be positive, got {tick}");
         assert!(
-            (-736_000_000..=-735_800_000).contains(&tick),
-            "tick {tick} not in expected ≈[-736.0M, -735.8M] range"
+            (735_800_000..=736_000_000).contains(&tick),
+            "tick {tick} not in expected ≈[735.8M, 736.0M] range"
         );
 
         let contract_price = human_to_contract_price(125.0, 6, 18);
         assert!(
-            (contract_price - 1.25e-10).abs() < 1e-22,
-            "raw price {contract_price:e} != 1.25e-10"
+            (contract_price - 8.0e9).abs() < 1.0,
+            "raw price {contract_price:e} != 8e9"
         );
 
         // Inverse: the human price of the computed tick must round-trip near $125.
@@ -87,7 +88,7 @@ mod tests {
         // $125 ± 1% spread
         let bid = price_to_tick_floor(125.0 * 0.99, 6, 18);
         let ask = price_to_tick_ceil(125.0 * 1.01, 6, 18);
-        assert!(bid < ask);
+        assert!(bid > ask);
         let bid_px = tick_to_human_price(bid, 6, 18);
         let ask_px = tick_to_human_price(ask, 6, 18);
         assert!(bid_px < 125.0 && ask_px > 125.0);

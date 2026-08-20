@@ -23,7 +23,6 @@ struct Form {
     max_nvda: String,
     interval: String,
     live_enabled: bool,
-    confirmation: String,
 }
 impl Default for Form {
     fn default() -> Self {
@@ -38,7 +37,6 @@ impl Default for Form {
             max_nvda: c.max_nvda_inventory.to_string(),
             interval: c.interval_secs.to_string(),
             live_enabled: false,
-            confirmation: String::new(),
         }
     }
 }
@@ -128,13 +126,8 @@ impl Gui {
                 return;
             }
         };
-        if self.form.live_enabled
-            && (self.form.private_key.trim().is_empty() || self.form.confirmation != "I UNDERSTAND")
-        {
-            set_error(
-                &self.shared,
-                "Live trading requires a private key and exact confirmation: I UNDERSTAND",
-            );
+        if self.form.live_enabled && self.form.private_key.trim().is_empty() {
+            set_error(&self.shared, "Live trading requires a private key");
             return;
         }
         let rpc = self.form.rpc_url.clone();
@@ -225,21 +218,33 @@ async fn cycle_loop<P: Provider + Clone + Send + Sync + 'static>(
     stop: Arc<AtomicBool>,
     live: bool,
 ) -> anyhow::Result<()> {
-    let chain = provider.get_chain_id().await?;
+    let chain = tokio::select! {
+        chain = provider.get_chain_id() => chain?,
+        _ = wait_for_stop(&stop) => return Ok(()),
+    };
     anyhow::ensure!(
         chain == engine::EXPECTED_CHAIN_ID,
         "unexpected chain id {chain}, expected {}",
         engine::EXPECTED_CHAIN_ID
     );
     push(&shared, format!("RPC chain id verified: {chain}"));
+    if stop.load(Ordering::Relaxed) {
+        return Ok(());
+    }
     let state_path = engine::state_path();
     let mut active = engine::load_active_orders(&state_path)?;
     if live {
-        engine::reconcile_active_orders(&provider, owner, &mut active).await?;
+        tokio::select! {
+            result = engine::reconcile_active_orders(&provider, owner, &mut active) => result?,
+            _ = wait_for_stop(&stop) => return Ok(()),
+        }
         engine::save_active_orders(&state_path, &active)?;
     }
     loop {
-        let view = engine::inspect(&provider, owner, &cfg).await?;
+        let view = tokio::select! {
+            result = engine::inspect(&provider, owner, &cfg) => result?,
+            _ = wait_for_stop(&stop) => break,
+        };
         render_view(&shared, &view, &cfg);
         push(
             &shared,
@@ -252,14 +257,20 @@ async fn cycle_loop<P: Provider + Clone + Send + Sync + 'static>(
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            engine::run_cycle(&provider, owner, &cfg, &mut active).await?;
+            tokio::select! {
+                result = engine::run_cycle(&provider, owner, &cfg, &mut active) => result?,
+                _ = wait_for_stop(&stop) => break,
+            }
             engine::save_active_orders(&state_path, &active)?;
             push(&shared, "live cycle confirmed and state saved");
         }
         if stop.load(Ordering::Relaxed) {
             break;
         }
-        tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(cfg.interval_secs)) => {},
+            _ = wait_for_stop(&stop) => break,
+        }
     }
     if let Ok(mut s) = shared.lock() {
         s.running = false;
@@ -267,6 +278,12 @@ async fn cycle_loop<P: Provider + Clone + Send + Sync + 'static>(
     }
     Ok(())
 }
+async fn wait_for_stop(stop: &AtomicBool) {
+    while !stop.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 impl eframe::App for Gui {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(Duration::from_millis(250));
@@ -311,13 +328,6 @@ impl eframe::App for Gui {
                 &mut self.form.live_enabled,
                 "Enable LIVE trading (default OFF)",
             );
-            if self.form.live_enabled {
-                ui.colored_label(
-                    egui::Color32::RED,
-                    "REAL TRANSACTIONS: type I UNDERSTAND to arm",
-                );
-                ui.text_edit_singleline(&mut self.form.confirmation);
-            }
             ui.horizontal(|ui| {
                 if ui
                     .add_enabled(!running, egui::Button::new("Start"))

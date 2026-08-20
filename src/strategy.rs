@@ -95,18 +95,18 @@ pub fn compute_quotes(
     let ask_tick = tick::price_to_tick_ceil(ask_px, cfg.decimals0, cfg.decimals1);
 
     // Checked arithmetic avoids wrapping at the protocol's i32 tick limits.
-    let bid = top_bid.map_or(Some(bid_tick), |top| top.tick.checked_add(1));
-    let ask = top_ask.map_or(Some(ask_tick), |top| top.tick.checked_sub(1));
-    let bid = bid.filter(|&tick| top_ask.is_none_or(|ask| tick < ask.tick));
-    let ask = ask.filter(|&tick| top_bid.is_none_or(|bid| tick > bid.tick));
+    let bid = top_bid.map_or(Some(bid_tick), |top| top.tick.checked_sub(1));
+    let ask = top_ask.map_or(Some(ask_tick), |top| top.tick.checked_add(1));
+    let bid = bid.filter(|&tick| top_ask.is_none_or(|ask| tick > ask.tick));
+    let ask = ask.filter(|&tick| top_bid.is_none_or(|bid| tick < bid.tick));
 
     let (bid, ask) = match (bid, ask) {
         (Some(bid), Some(ask))
-            if i64::from(ask) - i64::from(bid) >= i64::from(cfg.min_tick_gap) =>
+            if i64::from(bid) - i64::from(ask) >= i64::from(cfg.min_tick_gap) =>
         {
             (Some(bid), Some(ask))
         }
-        (Some(bid), Some(_)) => (Some(bid), None),
+        (Some(_), Some(ask)) => (None, Some(ask)),
         (bid, ask) => (bid, ask),
     };
 
@@ -140,7 +140,7 @@ mod tests {
         let quotes = compute_quotes(&cfg, None, None).unwrap();
         let bid = quotes.bid.unwrap();
         let ask = quotes.ask.unwrap();
-        assert!(bid.tick < ask.tick);
+        assert!(bid.tick > ask.tick);
         assert_eq!(bid.quantity, cfg.bid_quantity);
         assert_eq!(ask.quantity, cfg.ask_quantity);
         let bid_px = tick::tick_to_human_price(bid.tick, cfg.decimals0, cfg.decimals1);
@@ -152,18 +152,18 @@ mod tests {
     fn test_compute_quotes_improves_both_sides() {
         let cfg = MmConfig::default();
         let bid = Order {
-            tick: -736_000_000,
+            tick: 736_000_000,
             quantity: 1,
             nonce: 0,
         };
         let ask = Order {
-            tick: -735_000_000,
+            tick: 735_000_000,
             quantity: 1,
             nonce: 0,
         };
         let quotes = compute_quotes(&cfg, Some(&bid), Some(&ask)).unwrap();
-        assert_eq!(quotes.bid.unwrap().tick, bid.tick + 1);
-        assert_eq!(quotes.ask.unwrap().tick, ask.tick - 1);
+        assert_eq!(quotes.bid.unwrap().tick, bid.tick - 1);
+        assert_eq!(quotes.ask.unwrap().tick, ask.tick + 1);
     }
 
     #[test]
@@ -173,25 +173,25 @@ mod tests {
             ..Default::default()
         };
         let bid = Order {
-            tick: -735_900_000,
+            tick: 735_900_000,
             quantity: 1,
             nonce: 0,
         };
         let ask = Order {
-            tick: bid.tick + 3,
+            tick: bid.tick - 3,
             quantity: 1,
             nonce: 0,
         };
         let quotes = compute_quotes(&cfg, Some(&bid), Some(&ask)).unwrap();
-        assert_eq!(quotes.bid.unwrap().tick, bid.tick + 1);
-        assert!(quotes.ask.is_none());
+        assert!(quotes.bid.is_none());
+        assert_eq!(quotes.ask.unwrap().tick, ask.tick + 1);
     }
 
     #[test]
     fn test_tick_overflow_disables_side() {
         let cfg = MmConfig::default();
         let top_bid = Order {
-            tick: i32::MAX,
+            tick: i32::MIN,
             quantity: 1,
             nonce: 0,
         };

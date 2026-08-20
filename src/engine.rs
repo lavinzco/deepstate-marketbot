@@ -501,42 +501,108 @@ pub async fn fetch_top_of_book<P: Provider + Clone + Send + Sync + 'static>(
     book_id: B256,
 ) -> Result<(Option<Order>, Option<Order>)> {
     let roots = v1.roots(token0, token1, U256::from(epoch)).call().await?;
-    let ask_root = roots.askRoot;
-    let bid_root = roots.bidRoot;
-    let (bid, bid_nonce) = walk_top(v1, book_id, bid_root).await?;
-    let (ask, ask_nonce) = walk_top(v1, book_id, ask_root).await?;
     let bid_meta = v1.topOrder(book_id, true).call().await?;
     let ask_meta = v1.topOrder(book_id, false).call().await?;
-    ensure!(
-        bid.map_or(bid_nonce == 0, |o| o.nonce == bid_meta.nonce),
-        "bid top nonce mismatch"
-    );
-    ensure!(
-        ask.map_or(ask_nonce == 0, |o| o.nonce == ask_meta.nonce),
-        "ask top nonce mismatch"
-    );
+    let bid = walk_top(v1, book_id, roots.bidRoot, bid_meta.nonce).await?;
+    let ask = walk_top(v1, book_id, roots.askRoot, ask_meta.nonce).await?;
     Ok((bid, ask))
 }
 
 async fn walk_top<P: Provider + Clone + Send + Sync + 'static>(
     v1: &DeepstateV1::DeepstateV1Instance<P>,
     book_id: B256,
-    mut node: B256,
-) -> Result<(Option<Order>, u32)> {
-    for _ in 0..256 {
-        if node == B256::ZERO {
-            return Ok((None, 0));
-        }
-        let children = v1.tree(book_id, node).call().await?;
-        let left = children.leftNode;
-        let right = children.rightNode;
-        if left == B256::ZERO {
-            let order = unpack(&node);
-            return Ok((Some(order), order.nonce));
-        }
-        node = if right != B256::ZERO { right } else { left };
+    root: B256,
+    target_nonce: u32,
+) -> Result<Option<Order>> {
+    if root == B256::ZERO || target_nonce == 0 {
+        return Ok(None);
     }
-    Err(anyhow::anyhow!("book tree exceeded 256 levels"))
+
+    let mut pending = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(node) = pending.pop() {
+        if node == B256::ZERO || !visited.insert(node) {
+            continue;
+        }
+        ensure!(visited.len() <= 10_000, "order tree exceeded 10000 nodes");
+        let order = unpack(&node);
+        if order.nonce == target_nonce {
+            return Ok(Some(order));
+        }
+        let links = v1.tree(book_id, node).call().await?;
+        pending.push(links.leftNode);
+        pending.push(links.rightNode);
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+fn find_order_by_nonce(
+    root: B256,
+    target_nonce: u32,
+    children: &[(B256, B256, B256)],
+) -> Result<Option<Order>> {
+    if root == B256::ZERO || target_nonce == 0 {
+        return Ok(None);
+    }
+    let mut pending = vec![root];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(node) = pending.pop() {
+        if node == B256::ZERO || !visited.insert(node) {
+            continue;
+        }
+        let order = unpack(&node);
+        if order.nonce == target_nonce {
+            return Ok(Some(order));
+        }
+        let (_, left, right) = children
+            .iter()
+            .find(|(candidate, _, _)| *candidate == node)
+            .ok_or_else(|| anyhow::anyhow!("order tree is missing node links"))?;
+        pending.push(*left);
+        pending.push(*right);
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod order_tree_tests {
+    use super::*;
+    use crate::order::pack;
+
+    #[test]
+    fn finds_target_nonce_in_non_preferred_branch() {
+        let root = pack(1, 1, 10).unwrap();
+        let left = pack(2, 1, 11).unwrap();
+        let right = pack(3, 1, 717_955_021).unwrap();
+        let children = vec![
+            (root, left, right),
+            (left, B256::ZERO, B256::ZERO),
+            (right, B256::ZERO, B256::ZERO),
+        ];
+
+        let found = find_order_by_nonce(root, 717_955_021, &children).unwrap();
+        assert_eq!(found.unwrap().tick, 3);
+    }
+
+    #[test]
+    fn empty_and_cyclic_trees_are_safe() {
+        assert_eq!(find_order_by_nonce(B256::ZERO, 1, &[]).unwrap(), None);
+
+        let root = pack(1, 1, 10).unwrap();
+        let children = vec![(root, root, B256::ZERO)];
+        assert_eq!(find_order_by_nonce(root, 99, &children).unwrap(), None);
+    }
+
+    #[test]
+    fn missing_links_are_rejected() {
+        let root = pack(1, 1, 10).unwrap();
+        let child = pack(2, 1, 11).unwrap();
+        let error = find_order_by_nonce(root, 99, &[(root, child, B256::ZERO)])
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("missing node links"));
+    }
 }
 
 /// Close a resting order and claim its rewards.
