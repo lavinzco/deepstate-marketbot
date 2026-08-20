@@ -234,11 +234,13 @@ async fn cycle_loop<P: Provider + Clone + Send + Sync + 'static>(
     let state_path = engine::state_path();
     let mut active = engine::load_active_orders(&state_path)?;
     if live {
+        push(&shared, "reconciling persisted live orders (if any)...");
         tokio::select! {
             result = engine::reconcile_active_orders(&provider, owner, &mut active) => result?,
             _ = wait_for_stop(&stop) => return Ok(()),
         }
         engine::save_active_orders(&state_path, &active)?;
+        push(&shared, "startup order reconciliation complete");
     }
     loop {
         let view = tokio::select! {

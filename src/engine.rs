@@ -300,6 +300,13 @@ pub async fn reconcile_active_orders<P: Provider + Clone + Send + Sync + 'static
     owner: Address,
     active: &mut ActiveOrders,
 ) -> Result<()> {
+    // A fresh wallet has no local order state. Scanning both complete on-chain
+    // trees is extremely expensive because each node requires several RPC calls;
+    // defer discovery until the bot has persisted an order we need to reconcile.
+    if active.bid.is_none() && active.ask.is_none() {
+        info!("startup reconcile skipped: no persisted active orders");
+        return Ok(());
+    }
     let (token0, token1) = sorted_pair();
     let engine = DeepstateV1::new(ROUTER, provider.clone());
     let epoch = engine
