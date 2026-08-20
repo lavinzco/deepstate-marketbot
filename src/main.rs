@@ -10,6 +10,7 @@
 //!   DEEPSTATE_INTERVAL     quote refresh interval seconds (default 30)
 //!   DEEPSTATE_BID_QTY      bid size in NVDA base units, 18 decimals (default 1e15 = 0.001 NVDA)
 //!   DEEPSTATE_ASK_QTY      ask size in NVDA base units, 18 decimals (default 1e18 = 1 NVDA)
+//!   DEEPSTATE_MAX_NVDA     maximum wallet NVDA inventory, raw units (default 2e18 = 2 NVDA)
 
 use alloy::primitives::{Address, B256, U256};
 use alloy::providers::{Provider, ProviderBuilder};
@@ -19,7 +20,7 @@ use deepstate_mm::contracts::{
     compute_pool_id, sorted_pair, DeepstateRewarder, DeepstateV1, ERC20, REWARDER, ROUTER,
 };
 use deepstate_mm::order::{pack, unpack, Order};
-use deepstate_mm::strategy::{compute_quotes, describe_order, MmConfig};
+use deepstate_mm::strategy::{apply_inventory_limit, compute_quotes, describe_order, MmConfig};
 use std::env;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -98,7 +99,7 @@ async fn main() -> Result<()> {
     let mut active = ActiveOrders::default();
 
     loop {
-        match run_cycle(&provider, &cfg, &mut active).await {
+        match run_cycle(&provider, address, &cfg, &mut active).await {
             Ok(()) => {}
             Err(e) => warn!("cycle error: {e:#}"),
         }
@@ -123,6 +124,9 @@ fn load_config() -> Result<MmConfig> {
     if let Ok(v) = env::var("DEEPSTATE_ASK_QTY") {
         cfg.ask_quantity = v.parse().expect("DEEPSTATE_ASK_QTY must be u128");
     }
+    if let Ok(v) = env::var("DEEPSTATE_MAX_NVDA") {
+        cfg.max_nvda_inventory = v.parse().expect("DEEPSTATE_MAX_NVDA must be u128");
+    }
 
     // A5: validate configuration before the bot starts quoting.
     ensure!(
@@ -144,6 +148,7 @@ fn load_config() -> Result<MmConfig> {
         cfg.bid_quantity > 0 && cfg.ask_quantity > 0,
         "DEEPSTATE_BID_QTY and DEEPSTATE_ASK_QTY must be > 0"
     );
+    ensure!(cfg.max_nvda_inventory > 0, "DEEPSTATE_MAX_NVDA must be > 0");
     Ok(cfg)
 }
 
@@ -167,6 +172,7 @@ async fn ensure_allowance<P: Provider + Clone + Send + Sync + 'static>(
 
 async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
     provider: &P,
+    owner: Address,
     cfg: &MmConfig,
     active: &mut ActiveOrders,
 ) -> Result<()> {
@@ -180,7 +186,15 @@ async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
     info!(epoch, ?book_id, "cycle start");
 
     let (top_bid, top_ask) = fetch_top_of_book(&v1, token0, token1, epoch, book_id).await?;
-    let quotes = compute_quotes(cfg, top_bid.as_ref(), top_ask.as_ref())?;
+    let mut quotes = compute_quotes(cfg, top_bid.as_ref(), top_ask.as_ref())?;
+    let nvda = ERC20::new(token1, provider.clone());
+    let inventory = nvda.balanceOf(owner).call().await?.to::<u128>();
+    apply_inventory_limit(&mut quotes, inventory, cfg.max_nvda_inventory);
+    info!(
+        inventory,
+        max_inventory = cfg.max_nvda_inventory,
+        "inventory risk check"
+    );
     info!(
         bid = describe_order(&quotes.bid, cfg.decimals0, cfg.decimals1),
         ask = describe_order(&quotes.ask, cfg.decimals0, cfg.decimals1),
@@ -201,29 +215,32 @@ async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
     }
 
     // Place fresh bid + ask.
-    let bid_packed = pack(quotes.bid.tick, quotes.bid.quantity, 0)?;
-    let ask_packed = pack(quotes.ask.tick, quotes.ask.quantity, 0)?;
-
-    let bid_resting = place_order(provider, token0, token1, epoch, bid_packed, true).await?;
-    if bid_resting != B256::ZERO {
-        active.bid = Some(ActiveOrder {
-            packed: bid_resting,
-            epoch,
-            sold_token: token0,
-            claimant_registered: false,
-            cancelled: false,
-        }); // bid sells USDG
+    if quotes.bid.quantity > 0 {
+        let bid_packed = pack(quotes.bid.tick, quotes.bid.quantity, 0)?;
+        let bid_resting = place_order(provider, token0, token1, epoch, bid_packed, true).await?;
+        if bid_resting != B256::ZERO {
+            active.bid = Some(ActiveOrder {
+                packed: bid_resting,
+                epoch,
+                sold_token: token0,
+                claimant_registered: false,
+                cancelled: false,
+            }); // bid sells USDG
+        }
     }
 
-    let ask_resting = place_order(provider, token0, token1, epoch, ask_packed, false).await?;
-    if ask_resting != B256::ZERO {
-        active.ask = Some(ActiveOrder {
-            packed: ask_resting,
-            epoch,
-            sold_token: token1,
-            claimant_registered: false,
-            cancelled: false,
-        }); // ask sells NVDA
+    if quotes.ask.quantity > 0 {
+        let ask_packed = pack(quotes.ask.tick, quotes.ask.quantity, 0)?;
+        let ask_resting = place_order(provider, token0, token1, epoch, ask_packed, false).await?;
+        if ask_resting != B256::ZERO {
+            active.ask = Some(ActiveOrder {
+                packed: ask_resting,
+                epoch,
+                sold_token: token1,
+                claimant_registered: false,
+                cancelled: false,
+            }); // ask sells NVDA
+        }
     }
 
     info!("cycle complete");

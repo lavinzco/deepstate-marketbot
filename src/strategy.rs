@@ -27,6 +27,8 @@ pub struct MmConfig {
     pub decimals1: u8,
     /// Quote refresh interval in seconds.
     pub interval_secs: u64,
+    /// Maximum wallet inventory of NVDA in raw base units (default 2 NVDA).
+    pub max_nvda_inventory: u128,
 }
 
 impl Default for MmConfig {
@@ -40,6 +42,7 @@ impl Default for MmConfig {
             decimals0: 6,
             decimals1: 18,
             interval_secs: 30,
+            max_nvda_inventory: 2_000_000_000_000_000_000u128,
         }
     }
 }
@@ -49,6 +52,13 @@ impl Default for MmConfig {
 pub struct Quotes {
     pub bid: Order,
     pub ask: Order,
+}
+
+/// Cap new quotes against current NVDA inventory.
+pub fn apply_inventory_limit(quotes: &mut Quotes, inventory: u128, max_inventory: u128) {
+    let bid_room = max_inventory.saturating_sub(inventory);
+    quotes.bid.quantity = quotes.bid.quantity.min(bid_room);
+    quotes.ask.quantity = quotes.ask.quantity.min(inventory);
 }
 
 /// Compute bid/ask orders. `top_bid`/`top_ask` are the current best (None if empty).
@@ -170,5 +180,27 @@ mod tests {
             quotes.ask.tick - quotes.bid.tick,
             cfg.min_tick_gap
         );
+    }
+
+    #[test]
+    fn test_inventory_limit_caps_both_sides() {
+        let cfg = MmConfig::default();
+        let mut quotes = compute_quotes(&cfg, None, None).unwrap();
+        apply_inventory_limit(
+            &mut quotes,
+            1_500_000_000_000_000_000,
+            cfg.max_nvda_inventory,
+        );
+        assert_eq!(quotes.bid.quantity, 1_000_000_000_000_000);
+        assert_eq!(quotes.ask.quantity, 1_000_000_000_000_000_000);
+    }
+
+    #[test]
+    fn test_inventory_limit_disables_bid_at_cap() {
+        let cfg = MmConfig::default();
+        let mut quotes = compute_quotes(&cfg, None, None).unwrap();
+        apply_inventory_limit(&mut quotes, cfg.max_nvda_inventory, cfg.max_nvda_inventory);
+        assert_eq!(quotes.bid.quantity, 0);
+        assert_eq!(quotes.ask.quantity, cfg.ask_quantity);
     }
 }
