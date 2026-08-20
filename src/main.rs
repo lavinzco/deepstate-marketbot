@@ -8,8 +8,8 @@
 //!   DEEPSTATE_MID_PRICE    reference mid price in USDG per NVDA
 //!   DEEPSTATE_SPREAD       half-spread fraction (default 0.005)
 //!   DEEPSTATE_INTERVAL     quote refresh interval seconds (default 30)
-//!   DEEPSTATE_BID_QTY      bid size in NVDA base units, 18 decimals (default 1e15 = 0.001 NVDA)
-//!   DEEPSTATE_ASK_QTY      ask size in NVDA base units, 18 decimals (default 1e18 = 1 NVDA)
+//!   DEEPSTATE_BID_QTY      bid size in USDG raw units, 6 decimals (default 1e6 = 1 USDG)
+//!   DEEPSTATE_ASK_QTY      ask size in NVDA raw units, 18 decimals (default 1e18 = 1 NVDA)
 //!   DEEPSTATE_MAX_NVDA     maximum wallet NVDA inventory, raw units (default 2e18 = 2 NVDA)
 
 use alloy::primitives::{Address, B256, U256};
@@ -20,7 +20,8 @@ use deepstate_mm::contracts::{
     compute_pool_id, sorted_pair, DeepstateRewarder, DeepstateV1, ERC20, REWARDER, ROUTER,
 };
 use deepstate_mm::order::{pack, unpack, Order};
-use deepstate_mm::strategy::{apply_inventory_limit, compute_quotes, describe_order, MmConfig};
+use deepstate_mm::strategy::{apply_balance_limit, compute_quotes, describe_order, MmConfig};
+use serde::{Deserialize, Serialize};
 use std::env;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -29,8 +30,42 @@ use tracing_subscriber::EnvFilter;
 const DEFAULT_RPC: &str = "https://rpc.mainnet.chain.robinhood.com";
 const EXPECTED_CHAIN_ID: u64 = 4663;
 
+fn state_path() -> String {
+    env::var("DEEPSTATE_STATE_FILE").unwrap_or_else(|_| "active_orders.json".to_string())
+}
+
+fn load_active_orders(path: &str) -> Result<ActiveOrders> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => Ok(serde_json::from_str(&contents)?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ActiveOrders::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_active_orders(path: &str, active: &ActiveOrders) -> Result<()> {
+    let temporary = format!("{path}.tmp");
+    std::fs::write(&temporary, serde_json::to_vec_pretty(active)?)?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
+}
+
+async fn wait_receipt<P: Provider + Clone + Send + Sync + 'static>(
+    provider: &P,
+    hash: B256,
+) -> Result<alloy::rpc::types::TransactionReceipt> {
+    for _ in 0..60 {
+        if let Some(receipt) = provider.get_transaction_receipt(hash).await? {
+            return Ok(receipt);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    Err(anyhow::anyhow!(
+        "receipt timeout for tx {hash}; refusing to resend"
+    ))
+}
+
 /// A resting order we have live on the book.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveOrder {
     /// Packed resting order returned by the engine (contains the assigned nonce).
     packed: B256,
@@ -40,9 +75,11 @@ struct ActiveOrder {
     sold_token: Address,
     claimant_registered: bool,
     cancelled: bool,
+    #[serde(default)]
+    last_tx_hash: Option<B256>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct ActiveOrders {
     bid: Option<ActiveOrder>,
     ask: Option<ActiveOrder>,
@@ -96,11 +133,14 @@ async fn main() -> Result<()> {
     .await?;
     info!("allowances ready");
 
-    let mut active = ActiveOrders::default();
+    let state = state_path();
+    let mut active = load_active_orders(&state)?;
+    reconcile_active_orders(&provider, address, &mut active).await?;
+    save_active_orders(&state, &active)?;
 
     loop {
         match run_cycle(&provider, address, &cfg, &mut active).await {
-            Ok(()) => {}
+            Ok(()) => save_active_orders(&state, &active)?,
             Err(e) => warn!("cycle error: {e:#}"),
         }
         tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
@@ -164,7 +204,8 @@ async fn ensure_allowance<P: Provider + Clone + Send + Sync + 'static>(
         return Ok(());
     }
     let pending = erc20.approve(ROUTER, U256::MAX).send().await?;
-    let receipt = pending.get_receipt().await?;
+    let hash = pending.tx_hash();
+    let receipt = wait_receipt(provider, *hash).await?;
     ensure!(receipt.status(), "approve failed for {token}");
     info!(%token, "approved");
     Ok(())
@@ -188,16 +229,32 @@ async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
     let (top_bid, top_ask) = fetch_top_of_book(&v1, token0, token1, epoch, book_id).await?;
     let mut quotes = compute_quotes(cfg, top_bid.as_ref(), top_ask.as_ref())?;
     let nvda = ERC20::new(token1, provider.clone());
-    let inventory = nvda.balanceOf(owner).call().await?.to::<u128>();
-    apply_inventory_limit(&mut quotes, inventory, cfg.max_nvda_inventory);
-    info!(
-        inventory,
-        max_inventory = cfg.max_nvda_inventory,
-        "inventory risk check"
+    let usdg = ERC20::new(token0, provider.clone());
+    let usdg_balance = usdg.balanceOf(owner).call().await?.to::<u128>();
+    let nvda_balance = nvda.balanceOf(owner).call().await?.to::<u128>();
+    apply_balance_limit(
+        &mut quotes,
+        usdg_balance,
+        nvda_balance,
+        cfg.max_nvda_inventory,
     );
     info!(
-        bid = describe_order(&quotes.bid, cfg.decimals0, cfg.decimals1),
-        ask = describe_order(&quotes.ask, cfg.decimals0, cfg.decimals1),
+        usdg_balance,
+        nvda_balance,
+        max_inventory = cfg.max_nvda_inventory,
+        "balance risk check"
+    );
+    info!(
+        bid = quotes
+            .bid
+            .as_ref()
+            .map(|order| describe_order(order, cfg.decimals0, cfg.decimals1))
+            .unwrap_or_else(|| "disabled".to_string()),
+        ask = quotes
+            .ask
+            .as_ref()
+            .map(|order| describe_order(order, cfg.decimals0, cfg.decimals1))
+            .unwrap_or_else(|| "disabled".to_string()),
         "computed quotes"
     );
 
@@ -214,10 +271,10 @@ async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
         active.ask.take();
     }
 
-    // Place fresh bid + ask.
-    if quotes.bid.quantity > 0 {
-        let bid_packed = pack(quotes.bid.tick, quotes.bid.quantity, 0)?;
-        let bid_resting = place_order(provider, token0, token1, epoch, bid_packed, true).await?;
+    if let Some(bid) = quotes.bid.as_ref().filter(|order| order.quantity > 0) {
+        let bid_packed = pack(bid.tick, bid.quantity, 0)?;
+        let bid_resting =
+            place_order(provider, owner, token0, token1, epoch, bid_packed, true).await?;
         if bid_resting != B256::ZERO {
             active.bid = Some(ActiveOrder {
                 packed: bid_resting,
@@ -225,13 +282,15 @@ async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
                 sold_token: token0,
                 claimant_registered: false,
                 cancelled: false,
+                last_tx_hash: None,
             }); // bid sells USDG
         }
     }
 
-    if quotes.ask.quantity > 0 {
-        let ask_packed = pack(quotes.ask.tick, quotes.ask.quantity, 0)?;
-        let ask_resting = place_order(provider, token0, token1, epoch, ask_packed, false).await?;
+    if let Some(ask) = quotes.ask.as_ref().filter(|order| order.quantity > 0) {
+        let ask_packed = pack(ask.tick, ask.quantity, 0)?;
+        let ask_resting =
+            place_order(provider, owner, token0, token1, epoch, ask_packed, false).await?;
         if ask_resting != B256::ZERO {
             active.ask = Some(ActiveOrder {
                 packed: ask_resting,
@@ -239,16 +298,133 @@ async fn run_cycle<P: Provider + Clone + Send + Sync + 'static>(
                 sold_token: token1,
                 claimant_registered: false,
                 cancelled: false,
+                last_tx_hash: None,
             }); // ask sells NVDA
         }
     }
-
     info!("cycle complete");
     Ok(())
 }
 
+/// Reconcile current-epoch orders after startup. Historical epochs cannot be
+/// enumerated from the router, so persisted older-epoch orders remain on disk.
+async fn reconcile_active_orders<P: Provider + Clone + Send + Sync + 'static>(
+    provider: &P,
+    owner: Address,
+    active: &mut ActiveOrders,
+) -> Result<()> {
+    let (token0, token1) = sorted_pair();
+    let engine = DeepstateV1::new(ROUTER, provider.clone());
+    let epoch = engine
+        .poolEpoch(compute_pool_id(token0, token1))
+        .call()
+        .await?
+        .to::<u64>();
+    let book_id = engine
+        .bookId(token0, token1, U256::from(epoch))
+        .call()
+        .await?;
+    let roots = engine
+        .roots(token0, token1, U256::from(epoch))
+        .call()
+        .await?;
+    let bids = find_owned_orders(&engine, book_id, roots.bidRoot, owner).await?;
+    let asks = find_owned_orders(&engine, book_id, roots.askRoot, owner).await?;
+    ensure!(
+        bids.len() <= 1,
+        "multiple owned bid orders found during reconcile"
+    );
+    ensure!(
+        asks.len() <= 1,
+        "multiple owned ask orders found during reconcile"
+    );
+    if active
+        .bid
+        .as_ref()
+        .is_some_and(|order| order.epoch == epoch)
+        && active
+            .bid
+            .as_ref()
+            .is_some_and(|order| !bids.contains(&order.packed))
+    {
+        warn!("persisted bid is absent from the current order tree; dropping stale state");
+        active.bid = None;
+    }
+    if active
+        .ask
+        .as_ref()
+        .is_some_and(|order| order.epoch == epoch)
+        && active
+            .ask
+            .as_ref()
+            .is_some_and(|order| !asks.contains(&order.packed))
+    {
+        warn!("persisted ask is absent from the current order tree; dropping stale state");
+        active.ask = None;
+    }
+    if active.bid.is_none() {
+        if let Some(&packed) = bids.first() {
+            active.bid = Some(ActiveOrder {
+                packed,
+                epoch,
+                sold_token: token0,
+                claimant_registered: false,
+                cancelled: false,
+                last_tx_hash: None,
+            });
+        }
+    }
+    if active.ask.is_none() {
+        if let Some(&packed) = asks.first() {
+            active.ask = Some(ActiveOrder {
+                packed,
+                epoch,
+                sold_token: token1,
+                claimant_registered: false,
+                cancelled: false,
+                last_tx_hash: None,
+            });
+        }
+    }
+    info!(
+        epoch,
+        discovered_bids = bids.len(),
+        discovered_asks = asks.len(),
+        "startup reconcile complete"
+    );
+    Ok(())
+}
+
+async fn find_owned_orders<P: Provider + Clone + Send + Sync + 'static>(
+    engine: &DeepstateV1::DeepstateV1Instance<P>,
+    book_id: B256,
+    root: B256,
+    owner: Address,
+) -> Result<Vec<B256>> {
+    let mut stack = vec![root];
+    let mut found = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node == B256::ZERO {
+            continue;
+        }
+        let key = engine.orderId(book_id, node).call().await?;
+        if engine.ownerOfOrder(key).call().await? == owner {
+            found.push(node);
+        }
+        let children = engine.tree(book_id, node).call().await?;
+        stack.push(children.leftNode);
+        stack.push(children.rightNode);
+        ensure!(
+            stack.len() < 10000,
+            "order tree traversal exceeded safety bound"
+        );
+    }
+    Ok(found)
+}
+
 async fn place_order<P: Provider + Clone + Send + Sync + 'static>(
     provider: &P,
+    owner: Address,
     token0: Address,
     token1: Address,
     epoch: u64,
@@ -265,31 +441,50 @@ async fn place_order<P: Provider + Clone + Send + Sync + 'static>(
         noRest: false,
         fillOrKill: false,
     };
-    // S2: simulate first to get the resting order (engine assigns the nonce at fill time).
-    // The returned bytes32 is the order we must store as active and cancel later.
-    let resting = v1.fill(params.clone()).call().await?;
+    // S2: simulation is only a candidate; the confirmed transaction is reconciled below.
+    let simulated = v1.fill(params.clone()).call().await?;
     let pending = v1.fill(params).send().await?;
-    let receipt = pending.get_receipt().await?;
+    let tx_hash = pending.tx_hash();
+    let receipt = wait_receipt(provider, *tx_hash).await?;
     ensure!(receipt.status(), "fill tx failed");
     let side = if is_bid { "bid" } else { "ask" };
-    info!(%side, %resting, tx=%receipt.transaction_hash, "order placed");
-    if resting == B256::ZERO {
+    info!(%side, tx=%receipt.transaction_hash, "fill confirmed; reconciling order tree");
+    if simulated == B256::ZERO {
         info!(%side, tx=%receipt.transaction_hash, "fill completed without resting order");
-        return Ok(resting);
+        return Ok(B256::ZERO);
     }
-    let key = v1
-        .orderId(
-            v1.bookId(token0, token1, U256::from(epoch)).call().await?,
-            resting,
-        )
-        .call()
-        .await?;
-    let owner = v1.ownerOfOrder(key).call().await?;
+    let requested = unpack(&simulated);
+    let book_id = v1.bookId(token0, token1, U256::from(epoch)).call().await?;
+    let roots = v1.roots(token0, token1, U256::from(epoch)).call().await?;
+    let root = if is_bid { roots.bidRoot } else { roots.askRoot };
+    let mut stack = vec![root];
+    let mut matches = Vec::new();
+    while let Some(node) = stack.pop() {
+        if node == B256::ZERO {
+            continue;
+        }
+        let candidate = unpack(&node);
+        if candidate.tick == requested.tick && candidate.quantity == requested.quantity {
+            let key = v1.orderId(book_id, node).call().await?;
+            if v1.ownerOfOrder(key).call().await? == owner {
+                matches.push(node);
+            }
+        }
+        let children = v1.tree(book_id, node).call().await?;
+        stack.push(children.leftNode);
+        stack.push(children.rightNode);
+        ensure!(
+            stack.len() < 10000,
+            "order tree traversal exceeded safety bound"
+        );
+    }
     ensure!(
-        owner != Address::ZERO,
-        "returned resting order has no on-chain owner"
+        matches.len() <= 1,
+        "multiple matching owned resting orders found"
     );
-    Ok(resting)
+    matches
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("fill confirmed but no unique owned resting order found"))
 }
 
 async fn cancel_order<P: Provider + Clone + Send + Sync + 'static>(
@@ -298,16 +493,17 @@ async fn cancel_order<P: Provider + Clone + Send + Sync + 'static>(
     token1: Address,
     epoch: u64,
     order: B256,
-) -> Result<()> {
+) -> Result<B256> {
     let v1 = DeepstateV1::new(ROUTER, provider.clone());
     let pending = v1
         .cancel(token0, token1, U256::from(epoch), order)
         .send()
         .await?;
-    let receipt = pending.get_receipt().await?;
+    let tx_hash = pending.tx_hash();
+    let receipt = wait_receipt(provider, *tx_hash).await?;
     ensure!(receipt.status(), "cancel tx failed");
     info!(%order, tx=%receipt.transaction_hash, "order cancelled");
-    Ok(())
+    Ok(receipt.transaction_hash)
 }
 
 async fn fetch_top_of_book<P: Provider + Clone + Send + Sync + 'static>(
@@ -380,7 +576,9 @@ async fn close_active_order<P: Provider + Clone + Send + Sync + 'static>(
             .registerClaimant(book_id, order.packed)
             .send()
             .await?;
-        let receipt = pending.get_receipt().await?;
+        let tx_hash = pending.tx_hash();
+        order.last_tx_hash = Some(*tx_hash);
+        let receipt = wait_receipt(provider, *tx_hash).await?;
         ensure!(receipt.status(), "registerClaimant tx failed");
         order.claimant_registered = true;
         info!(order=%order.packed, tx=%receipt.transaction_hash, "claimant registered");
@@ -388,7 +586,8 @@ async fn close_active_order<P: Provider + Clone + Send + Sync + 'static>(
 
     // 2. Cancel the order (releases collateral + any fills).
     if !order.cancelled {
-        cancel_order(provider, token0, token1, order.epoch, order.packed).await?;
+        let tx_hash = cancel_order(provider, token0, token1, order.epoch, order.packed).await?;
+        order.last_tx_hash = Some(tx_hash);
         order.cancelled = true;
     }
 
@@ -398,7 +597,9 @@ async fn close_active_order<P: Provider + Clone + Send + Sync + 'static>(
         .distributeRewards(book_id, order.packed, order.sold_token)
         .send()
         .await?;
-    let receipt = pending.get_receipt().await?;
+    let tx_hash = pending.tx_hash();
+    order.last_tx_hash = Some(*tx_hash);
+    let receipt = wait_receipt(provider, *tx_hash).await?;
     ensure!(receipt.status(), "distributeRewards tx failed");
     info!(order=%order.packed, tx=%receipt.transaction_hash, "rewards distributed");
     Ok(())

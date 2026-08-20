@@ -30,8 +30,8 @@ export DEEPSTATE_PRIVATE_KEY=0x你的私钥
 export DEEPSTATE_MID_PRICE=125.0        # NVDA 参考价 (USDG per NVDA)
 export DEEPSTATE_SPREAD=0.005           # 半价差 0.5%
 export DEEPSTATE_INTERVAL=30            # 报价刷新间隔（秒）
-export DEEPSTATE_BID_QTY=1000000000000000  # bid 数量 (0.001 NVDA, base units)
-export DEEPSTATE_ASK_QTY=1000000000000000000  # ask 数量 (1 NVDA, 18 decimals)
+export DEEPSTATE_BID_QTY=1000000                 # bid: USDG raw units (1 USDG at 6 decimals)
+export DEEPSTATE_ASK_QTY=1000000000000000000    # ask: NVDA raw units (1 NVDA at 18 decimals)
 
 # 2. 构建 + 测试
 cargo build
