@@ -21,6 +21,7 @@ use alloy::primitives::{Address, B256, U256};
 use alloy::providers::Provider;
 use anyhow::{ensure, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -300,11 +301,19 @@ pub async fn reconcile_active_orders<P: Provider + Clone + Send + Sync + 'static
     owner: Address,
     active: &mut ActiveOrders,
 ) -> Result<()> {
-    // A fresh wallet has no local order state. Scanning both complete on-chain
-    // trees is extremely expensive because each node requires several RPC calls;
-    // defer discovery until the bot has persisted an order we need to reconcile.
-    if active.bid.is_none() && active.ask.is_none() {
-        info!("startup reconcile skipped: no persisted active orders");
+    reconcile_active_orders_with_options(provider, owner, active, false).await
+}
+
+/// Reconcile startup state. Empty-state skipping is only allowed when the user
+/// explicitly confirmed that the wallet has no old on-chain orders.
+pub async fn reconcile_active_orders_with_options<P: Provider + Clone + Send + Sync + 'static>(
+    provider: &P,
+    owner: Address,
+    active: &mut ActiveOrders,
+    allow_empty_skip: bool,
+) -> Result<()> {
+    if allow_empty_skip && active.bid.is_none() && active.ask.is_none() {
+        info!("startup reconcile skipped: empty state explicitly confirmed");
         return Ok(());
     }
     let (token0, token1) = sorted_pair();
@@ -396,9 +405,10 @@ async fn find_owned_orders<P: Provider + Clone + Send + Sync + 'static>(
     owner: Address,
 ) -> Result<Vec<B256>> {
     let mut stack = vec![root];
+    let mut visited = HashSet::new();
     let mut found = Vec::new();
     while let Some(node) = stack.pop() {
-        if node == B256::ZERO {
+        if node == B256::ZERO || !visited.insert(node) {
             continue;
         }
         let key = engine.orderId(book_id, node).call().await?;

@@ -23,6 +23,7 @@ struct Form {
     max_nvda: String,
     interval: String,
     live_enabled: bool,
+    confirm_empty_reconcile_skip: bool,
 }
 impl Default for Form {
     fn default() -> Self {
@@ -37,6 +38,7 @@ impl Default for Form {
             max_nvda: c.max_nvda_inventory.to_string(),
             interval: c.interval_secs.to_string(),
             live_enabled: false,
+            confirm_empty_reconcile_skip: false,
         }
     }
 }
@@ -133,6 +135,7 @@ impl Gui {
         let rpc = self.form.rpc_url.clone();
         let key = self.form.private_key.clone();
         let live = self.form.live_enabled;
+        let confirm_empty_reconcile_skip = self.form.confirm_empty_reconcile_skip;
         let shared = Arc::clone(&self.shared);
         let stop = Arc::new(AtomicBool::new(false));
         self.stop = Some(Arc::clone(&stop));
@@ -172,8 +175,16 @@ impl Gui {
                             return;
                         }
                     };
-                    let result =
-                        cycle_loop(provider, owner, cfg, Arc::clone(&shared), stop, true).await;
+                    let result = cycle_loop(
+                        provider,
+                        owner,
+                        cfg,
+                        Arc::clone(&shared),
+                        stop,
+                        true,
+                        confirm_empty_reconcile_skip,
+                    )
+                    .await;
                     if let Err(e) = result {
                         set_error(&shared, format!("engine stopped: {e:#}"));
                     }
@@ -191,6 +202,7 @@ impl Gui {
                         cfg,
                         Arc::clone(&shared),
                         stop,
+                        false,
                         false,
                     )
                     .await;
@@ -217,6 +229,7 @@ async fn cycle_loop<P: Provider + Clone + Send + Sync + 'static>(
     shared: Arc<Mutex<Shared>>,
     stop: Arc<AtomicBool>,
     live: bool,
+    confirm_empty_reconcile_skip: bool,
 ) -> anyhow::Result<()> {
     let chain = tokio::select! {
         chain = provider.get_chain_id() => chain?,
@@ -236,7 +249,12 @@ async fn cycle_loop<P: Provider + Clone + Send + Sync + 'static>(
     if live {
         push(&shared, "reconciling persisted live orders (if any)...");
         tokio::select! {
-            result = engine::reconcile_active_orders(&provider, owner, &mut active) => result?,
+            result = engine::reconcile_active_orders_with_options(
+                &provider,
+                owner,
+                &mut active,
+                confirm_empty_reconcile_skip,
+            ) => result?,
             _ = wait_for_stop(&stop) => return Ok(()),
         }
         engine::save_active_orders(&state_path, &active)?;
@@ -329,6 +347,10 @@ impl eframe::App for Gui {
             ui.checkbox(
                 &mut self.form.live_enabled,
                 "Enable LIVE trading (default OFF)",
+            );
+            ui.checkbox(
+                &mut self.form.confirm_empty_reconcile_skip,
+                "LIVE startup: confirm chain has no old orders (skip scan)",
             );
             ui.horizontal(|ui| {
                 if ui

@@ -22,6 +22,7 @@ use deepstate_mm::contracts::{
 use deepstate_mm::order::{pack, unpack, Order};
 use deepstate_mm::strategy::{apply_balance_limit, compute_quotes, describe_order, MmConfig};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::env;
 use std::time::Duration;
 use tracing::{info, warn};
@@ -402,9 +403,10 @@ async fn find_owned_orders<P: Provider + Clone + Send + Sync + 'static>(
     owner: Address,
 ) -> Result<Vec<B256>> {
     let mut stack = vec![root];
+    let mut visited = HashSet::new();
     let mut found = Vec::new();
     while let Some(node) = stack.pop() {
-        if node == B256::ZERO {
+        if node == B256::ZERO || !visited.insert(node) {
             continue;
         }
         let key = engine.orderId(book_id, node).call().await?;
